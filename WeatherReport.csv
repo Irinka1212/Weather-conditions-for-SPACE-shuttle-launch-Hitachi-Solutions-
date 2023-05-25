@@ -1,0 +1,7 @@
+Day/Parameter,Average value, Max value, Min value, Median value,10
+Temperature (C),29,32,27,30,28
+Wind (m/s),6,15,2,2,3
+Humidity (%),35,80,15,30,20
+Precipitation (%),8,40,0,0,0
+Lightning,	,	,	,	,No
+Clouds,	,	,	,	,Cirrus
