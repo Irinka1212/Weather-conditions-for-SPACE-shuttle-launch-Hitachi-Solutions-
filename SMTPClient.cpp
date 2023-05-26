@@ -15,6 +15,69 @@ SMTPClient::SMTPClient(const std::string& smtpServer, const std::string& passwor
     }
 }
 
+SSL_CTX* SMTPClient::initSSL()
+{
+    // Initializing OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+
+    SSL_CTX* sslContext = SSL_CTX_new(SSLv23_client_method());
+    if (!sslContext)
+    {
+        std::cerr << "Failed to create SSL context.\n";
+        //std::cout << "Failed to create SSL context.\n";
+        ERR_print_errors_fp(stderr);
+        return nullptr;
+    }
+
+    return sslContext;
+}
+
+bool SMTPClient::performHandshake(SSL* ssl)
+{
+    int sslResult = SSL_connect(ssl);
+    if (sslResult <= 0)
+    {
+        int sslError = SSL_get_error(ssl, sslResult);
+        std::cerr << "SSL handshake failed. Error code: " << sslError << "\n";
+        //std::cout << "SSL handshake failed. Error code: " << sslError << "\n";
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+
+    return true;
+}
+
+bool SMTPClient::sendSSLData(SSL* ssl, const char* data, int dataSize)
+{
+    int result = SSL_write(ssl, data, dataSize);
+    if (result <= 0)
+    {
+        int sslError = SSL_get_error(ssl, result);
+        std::cerr << "Failed to send SSL data. Error code: " << sslError << "\n";
+        //std::cout << "Failed to send SSL data. Error code: " << sslError << "\n";
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+
+    return true;
+}
+
+bool SMTPClient::receiveSSLData(SSL* ssl, char* buffer, int bufferSize)
+{
+    int result = SSL_read(ssl, buffer, bufferSize);
+    if (result <= 0)
+    {
+        int sslError = SSL_get_error(ssl, result);
+        std::cerr << "Failed to receive SSL data. Error code: " << sslError << "\n";
+        //std::cout << "Failed to receive SSL data. Error code: " << sslError << "\n";
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+
+    return true;
+}
+
 void SMTPClient::sendFile(SOCKET socketVar, const std::string& fileName) 
 {
     std::ifstream file(fileName);
@@ -45,7 +108,14 @@ void SMTPClient::sendFile(SOCKET socketVar, const std::string& fileName)
  
 bool SMTPClient::sendEmail(const std::string& senderEmail, const std::string& receiverEmail, const std::string& fileName) 
 {
-    // Creating socket
+    SSL_library_init();
+    SSL_CTX* sslContext = initSSL();
+    if (!sslContext)
+    {
+        std::cout << "Failed to initialize SSL.\n";
+        return false;
+    }
+
     SOCKET socketVar;
     socketVar = socket(AF_INET, SOCK_STREAM, 0);
     if (socketVar == INVALID_SOCKET) 
@@ -54,7 +124,6 @@ bool SMTPClient::sendEmail(const std::string& senderEmail, const std::string& re
         return false;
     }
 
-    // Getting host
     struct hostent* host;
     host = gethostbyname(_smtpServer.c_str());
     if (host == NULL) 
@@ -72,6 +141,25 @@ bool SMTPClient::sendEmail(const std::string& senderEmail, const std::string& re
     if (connect(socketVar, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) == SOCKET_ERROR) 
     {
         std::cout << "Failed to connect to server.\n";
+        closesocket(socketVar);
+        return false;
+    }
+
+    SSL* ssl = SSL_new(sslContext);
+    if (!ssl)
+    {
+        std::cerr << "Failed to create SSL object.\n";
+        //std::cout << "Failed to create SSL object.\n";
+        ERR_print_errors_fp(stderr);
+        closesocket(socketVar);
+        return false;
+    }
+    SSL_set_fd(ssl, socketVar);
+
+    if (!performHandshake(ssl))
+    {
+        std::cout << "Failed handshake.\n";
+        SSL_free(ssl);
         closesocket(socketVar);
         return false;
     }
@@ -191,18 +279,12 @@ bool SMTPClient::sendEmail(const std::string& senderEmail, const std::string& re
     memset(response, 0, sizeof(response));
     recv(socketVar, response, sizeof(response), 0);
 
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+
     closesocket(socketVar);
+
+    SSL_CTX_free(sslContext);
 
     return true;
 }
-
-
-
-
-
-
-
-
-
-
-
