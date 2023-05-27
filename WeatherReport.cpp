@@ -165,12 +165,6 @@ void getWeatherReport(const std::string& fileName)
         std::stringstream ss(line);
         std::string token;
 
-        int sum = 0;
-        int average = 0;
-        int max = 0;
-        int min = 0;
-        int median = 0;
-
         while (std::getline(ss, token, ','))
         {
             row.push_back(token);
