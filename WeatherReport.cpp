@@ -4,6 +4,8 @@
 #include <vector>
 #include <regex>
 #include "SMTPClient.h"
+#include "Mail.h"
+#include <future>
 
 int getMax(std::vector<std::string> numbers)
 {
@@ -280,6 +282,17 @@ int main()
         std::cout << "This email is invalid.\n";
     }
 
-    SMTPClient client("smtp.abv.bg", password);
-    client.sendEmail(senderEmail, receiverEmail, "C:\\Users\\Irinka\\Desktop\\WeatherReport.csv");
+    SMTPClient smtpClient;
+
+    smtpClient.connect("smtp.abv.bg", 465);
+    std::string subject = "Test Email";
+    std::string body = "This is a test email.";
+
+    smtpClient.authLogin("smtp.abv.bg", 465, senderEmail, password);
+
+    Mail mail(senderEmail, receiverEmail, subject, body);
+    
+    smtpClient.sendEmail(mail);
+
+    return 0;
 }
