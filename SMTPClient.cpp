@@ -1,290 +1,229 @@
 #include "SMTPClient.h"
-#include <iostream>
+#include "Mail.h"
 #include <fstream>
-#include <sstream>
-#include <vector>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
+#include <boost/array.hpp>
+#include <boost/system/error_code.hpp>
 
-SMTPClient::SMTPClient(const std::string& smtpServer, const std::string& password) 
+std::string base64_encode(const std::string& input) 
 {
-    _smtpServer = smtpServer;
-    _password = password;
+	BIO* bmem = nullptr;
+	BIO* b64 = nullptr;
+	BUF_MEM* bptr = nullptr;
 
-    if (WSAStartup(MAKEWORD(2, 2), &_wsaData) != 0) 
-    {
-        std::cout << "Failed to initialize winsock.\n";
-    }
+	b64 = BIO_new(BIO_f_base64());
+	if (!b64) 
+	{
+		return "";
+	}
+
+	bmem = BIO_new(BIO_s_mem());
+	if (!bmem) 
+	{
+		BIO_free_all(b64);
+		return "";
+	}
+
+	b64 = BIO_push(b64, bmem);
+
+	BIO_write(b64, input.data(), static_cast<int>(input.length()));
+	BIO_flush(b64);
+
+	BIO_get_mem_ptr(b64, &bptr);
+
+	std::string encoded_data(bptr->data, bptr->length);
+
+	BIO_free_all(b64);
+
+	return encoded_data;
 }
 
-SSL_CTX* SMTPClient::initSSL()
+SMTPClient::SMTPClient() :
+	sslContext_(boost::asio::ssl::context::tls_client),
+	sslSocket_(service_, sslContext_),
+	socket_(sslSocket_.next_layer())
+{}
+
+void SMTPClient::write() 
 {
-    // Initializing OpenSSL
-    SSL_library_init();
-    SSL_load_error_strings();
+	boost::system::error_code error;
+	const std::string str = message_.str();
+	const boost::asio::const_buffers_1 buffer = boost::asio::buffer(str);
 
-    SSL_CTX* sslContext = SSL_CTX_new(SSLv23_client_method());
-    if (!sslContext)
-    {
-        std::cerr << "Failed to create SSL context.\n";
-        //std::cout << "Failed to create SSL context.\n";
-        ERR_print_errors_fp(stderr);
-        return nullptr;
-    }
+	if (tlsEnabled_) 
+	{
+		sslSocket_.write_some(buffer, error);
+	}
+	else 
+	{
+		socket_.write_some(buffer, error);
+	}
 
-    return sslContext;
+	if (error) 
+	{
+		std::cerr << "error: " << error.message();
+	}
+	message_.str(std::string());
 }
 
-bool SMTPClient::performHandshake(SSL* ssl)
+std::string SMTPClient::read()
 {
-    int sslResult = SSL_connect(ssl);
-    if (sslResult <= 0)
-    {
-        int sslError = SSL_get_error(ssl, sslResult);
-        std::cerr << "SSL handshake failed. Error code: " << sslError << "\n";
-        //std::cout << "SSL handshake failed. Error code: " << sslError << "\n";
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
+	boost::array<char, 4096> buffer;
+	std::string answer;
+	boost::system::error_code error;
+	std::size_t bytesReceived = 0;
 
-    return true;
+	std::function<void(const boost::system::error_code&, std::size_t)> readHandler;
+
+	if (tlsEnabled_)
+	{
+		readHandler = [&](const boost::system::error_code& ec, std::size_t bytesRead)
+		{
+			if (!ec)
+			{
+				bytesReceived = bytesRead;
+				answer.assign(buffer.data(), bytesReceived);
+			}
+			else
+			{
+				error = ec;
+			}
+		};
+
+		sslSocket_.async_read_some(boost::asio::buffer(buffer), readHandler);
+	}
+	else
+	{
+		readHandler = [&](const boost::system::error_code& ec, std::size_t bytesRead)
+		{
+			if (!ec)
+			{
+				bytesReceived = bytesRead;
+				answer.assign(buffer.data(), bytesReceived);
+			}
+			else
+			{
+				error = ec;
+			}
+		};
+
+		socket_.async_receive(boost::asio::buffer(buffer), readHandler);
+	}
+
+	if (error)
+	{
+		throw boost::system::system_error(error);
+	}
+
+	return answer;
 }
 
-bool SMTPClient::sendSSLData(SSL* ssl, const char* data, int dataSize)
+void SMTPClient::handshake() 
 {
-    int result = SSL_write(ssl, data, dataSize);
-    if (result <= 0)
-    {
-        int sslError = SSL_get_error(ssl, result);
-        std::cerr << "Failed to send SSL data. Error code: " << sslError << "\n";
-        //std::cout << "Failed to send SSL data. Error code: " << sslError << "\n";
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
-
-    return true;
+	std::string serverName = socket_.remote_endpoint().address().to_string();
+	if (tlsEnabled_) 
+	{
+		boost::system::error_code error;
+		tlsEnabled_ = false;
+		serverId_ = read();
+		message_ << "EHLO " << serverName << "\r\n";
+		write();
+		read();
+		message_ << "STARTTLS" << "\r\n";
+		write();
+		read();
+		sslSocket_.handshake(SslSocket::client, error);
+		if (error) 
+		{
+			std::cerr << "Handshake error: " << error.message();
+		}
+		tlsEnabled_ = true;
+	}
+	else 
+	{
+		serverId_ = read();
+	}
+	message_ << "EHLO " << serverName << "\r\n";
+	write();
+	read();
 }
 
-bool SMTPClient::receiveSSLData(SSL* ssl, char* buffer, int bufferSize)
+void SMTPClient::connect(const std::string& hostname, unsigned short port) 
 {
-    int result = SSL_read(ssl, buffer, bufferSize);
-    if (result <= 0)
-    {
-        int sslError = SSL_get_error(ssl, result);
-        std::cerr << "Failed to receive SSL data. Error code: " << sslError << "\n";
-        //std::cout << "Failed to receive SSL data. Error code: " << sslError << "\n";
-        ERR_print_errors_fp(stderr);
-        return false;
-    }
+	boost::system::error_code error = boost::asio::error::host_not_found;
+	boost::asio::ip::tcp::resolver resolver(service_);
+	boost::asio::ip::tcp::resolver::query query(hostname, std::to_string(port));
+	boost::asio::ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+	boost::asio::ip::tcp::resolver::iterator end;
 
-    return true;
+	while (error && endpoint_iterator != end) 
+	{
+		socket_.close();
+		socket_.connect(*endpoint_iterator++, error);
+	}
+
+	if (error) 
+	{
+		std::cerr << "error: " << error.message();
+	}
+	else 
+	{
+		handshake();
+	}
 }
 
-void SMTPClient::sendFile(SOCKET socketVar, const std::string& fileName) 
+void SMTPClient::authLogin(const std::string& hostname, unsigned short port, const std::string& username, const std::string& password)
 {
-    std::ifstream file(fileName);
-    if (!file.is_open())
-    {
-        std::cout << "Failed to open the file.\n";
-        return;
-    }
+	connect(hostname, port);
+	std::string user_hash = base64_encode(username);
+	std::string pswd_hash = base64_encode(password);
 
-    std::string line;
-    std::vector<std::string> data;
-    while (std::getline(file, line)) 
-    {
-        data.push_back(line);
-    }
-
-    file.close();
-
-    std::stringstream bufferStream;
-    for (const auto& entry : data) 
-    {
-        bufferStream << entry << '\n';
-    }
-    std::string fileContents = bufferStream.str();
-
-    send(socketVar, fileContents.c_str(), fileContents.length(), 0);
+	message_ << "AUTH LOGIN\r\n";
+	write();
+	read();
+	message_ << user_hash;
+	write();
+	read();
+	message_ << pswd_hash;
+	write();
+	read();
 }
- 
-bool SMTPClient::sendEmail(const std::string& senderEmail, const std::string& receiverEmail, const std::string& fileName) 
+
+void SMTPClient::sendEmail(const Mail& mail)
 {
-    SSL_library_init();
-    SSL_CTX* sslContext = initSSL();
-    if (!sslContext)
-    {
-        std::cout << "Failed to initialize SSL.\n";
-        return false;
-    }
+	const std::string& sender = mail.getSender();
+	const std::string& recipient = mail.getRecipient();
+	const std::string& contentType = mail.getContentType();
 
-    SOCKET socketVar;
-    socketVar = socket(AF_INET, SOCK_STREAM, 0);
-    if (socketVar == INVALID_SOCKET) 
-    {
-        std::cout << "Failed to create socket.\n";
-        return false;
-    }
+	message_ << "MAIL FROM: <" << sender << ">\r\n";
+	write();
+	read();
 
-    struct hostent* host;
-    host = gethostbyname(_smtpServer.c_str());
-    if (host == NULL) 
-    {
-        std::cout << "Failed to get hostname.\n";
-        closesocket(socketVar);
-        return false;
-    }
+	message_ << "RCPT TO: <" << recipient << ">\r\n";
+	write();
+	read();
 
-    // Getting server address
-    SOCKADDR_IN serverAddress;
-    serverAddress.sin_family = AF_INET; // IPv4 address family.
-    serverAddress.sin_port = htons(465); //convert the port number from host byte order to network byte order
-    serverAddress.sin_addr.s_addr = *((unsigned long*)host->h_addr); //sets the IP address of the server in the server address structure
-    if (connect(socketVar, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) == SOCKET_ERROR) 
-    {
-        std::cout << "Failed to connect to server.\n";
-        closesocket(socketVar);
-        return false;
-    }
+	message_ << "DATA\r\n";
+	write();
+	read();
 
-    SSL* ssl = SSL_new(sslContext);
-    if (!ssl)
-    {
-        std::cerr << "Failed to create SSL object.\n";
-        //std::cout << "Failed to create SSL object.\n";
-        ERR_print_errors_fp(stderr);
-        closesocket(socketVar);
-        return false;
-    }
-    SSL_set_fd(ssl, socketVar);
+	message_ << "From: " << sender << "\r\n"; 
 
-    if (!performHandshake(ssl))
-    {
-        std::cout << "Failed handshake.\n";
-        SSL_free(ssl);
-        closesocket(socketVar);
-        return false;
-    }
+	if (!contentType.empty()) 
+	{
+		message_ << "MIME-Version: 1.0\r\n";
+		message_ << "Content-Type: " << contentType << "\r\n";
+	}
 
-    // Starting the SMTP conversation
-    std::string ehloCommand = "EHLO localhost\r\n";
-    send(socketVar, ehloCommand.c_str(), ehloCommand.length(), 0);
+	message_ << "Subject: " << mail.getSubject() << "\r\n";
 
-    // Receiving response from the server
-    char response[4096];
-    memset(response, 0, sizeof(response)); // filling a block of memory with a particular value
-    recv(socketVar, response, sizeof(response), 0); // receiving data from the connected socket
+	message_ << "\r\n";
 
-    if (strstr(response, "AUTH") == nullptr)
-    {
-        std::cout << "Authentication not supported by the server.\n";
-    }
-    else
-    {
-        std::string authCommand = "AUTH LOGIN\r\n";
-        send(socketVar, authCommand.c_str(), authCommand.length(), 0);
-
-        memset(response, 0, sizeof(response));
-        recv(socketVar, response, sizeof(response), 0);
-
-        if (response[0] != '2') // status code for successful command is 2
-        {
-            std::cout << "Failed to send authentication.\n";
-            closesocket(socketVar);
-            return false;
-        }
-    }
-
-    send(socketVar, senderEmail.c_str(), senderEmail.length(), 0);
-    send(socketVar, "\r\n", 2, 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to send username.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    send(socketVar, _password.c_str(), _password.length(), 0);
-    send(socketVar, "\r\n", 2, 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to authenticate with the server.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    std::string mailFromCommand = "MAIL FROM:<" + senderEmail + ">\r\n";
-    send(socketVar, mailFromCommand.c_str(), mailFromCommand.length(), 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to set sender email.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    std::string rcptToCommand = "RCPT TO:<" + receiverEmail + ">\r\n";
-    send(socketVar, rcptToCommand.c_str(), rcptToCommand.length(), 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to set receiver email.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    std::string dataCommand = "DATA\r\n";
-    send(socketVar, dataCommand.c_str(), dataCommand.length(), 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to start email content.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    sendFile(socketVar, fileName);
-
-    std::string endMarker = "\r\n.\r\n";
-    send(socketVar, endMarker.c_str(), endMarker.length(), 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    if (response[0] != '2')
-    {
-        std::cout << "Failed to send email.\n";
-        closesocket(socketVar);
-        return false;
-    }
-
-    std::string quitCommand = "QUIT\r\n";
-    send(socketVar, quitCommand.c_str(), quitCommand.length(), 0);
-
-    memset(response, 0, sizeof(response));
-    recv(socketVar, response, sizeof(response), 0);
-
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-
-    closesocket(socketVar);
-
-    SSL_CTX_free(sslContext);
-
-    return true;
+	message_ << mail.getBody() << "\r\n.\r\n";
+	write();
+	read();
 }
