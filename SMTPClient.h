@@ -1,27 +1,30 @@
 #pragma once
-#include <string>
-#include <winsock.h>
-#pragma comment(lib,"wsock32")
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <sstream>
+#include "Mail.h"
 
 class SMTPClient 
 {
 public:
-    SMTPClient(const std::string& smtpServer, const std::string& password);
-    ~SMTPClient() { WSACleanup(); }
+    typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> SslSocket;
 
-    SSL_CTX* initSSL();
-    bool performHandshake(SSL* ssl);
-    bool sendSSLData(SSL* ssl, const char* data, int dataSize);
-    bool receiveSSLData(SSL* ssl, char* buffer, int bufferSize);
+    SMTPClient();
 
-    bool sendEmail(const std::string& senderEmail, const std::string& receiverEmail, const std::string& fileName);
+    void write();
+    std::string read();
 
+    void handshake();
+    void connect(const std::string& hostname, unsigned short port);
+    void authLogin(const std::string& hostname, unsigned short port, const std::string& username, const std::string& password);
+
+    void sendEmail(const Mail& mail);
 private:
-    std::string _smtpServer;
-    std::string _password;
-    WSADATA _wsaData;
-
-    void sendFile(SOCKET socketVar, const std::string& fileName);
+    std::string serverId_;
+    std::stringstream message_;
+    boost::asio::io_service service_;
+    boost::asio::ssl::context sslContext_;
+    SslSocket sslSocket_;
+    boost::asio::ip::tcp::socket& socket_;
+    bool tlsEnabled_;
 };
