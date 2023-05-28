@@ -5,7 +5,6 @@
 #include <regex>
 #include "SMTPClient.h"
 #include "Mail.h"
-#include <future>
 
 int getMax(std::vector<std::string> numbers)
 {
